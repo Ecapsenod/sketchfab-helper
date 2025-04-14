@@ -10,9 +10,12 @@ function waitForSketchfab(callback) {
 waitForSketchfab((Sketchfab) => {
     console.log("[Helper] Sketchfab API is available!");
 
-    window.addEventListener("message", async (event) => {
-        if (event.data === "EXTRACT_GEOMETRY") {
-            console.log("[Helper] Received EXTRACT_GEOMETRY signal");
+    window.addEventListener('message', function(event) {
+  if (event.data && event.data.type === 'EXTRACT_GEOMETRY') {
+    console.log("[Helper] Received EXTRACT_GEOMETRY signal");
+    waitForSketchfab().then(startExtraction).catch(console.error);
+  }
+});
 
             const iframe = document.querySelector('iframe');
             const uidMatch = window.location.href.match(/\/([0-9a-f]{32})/i);
