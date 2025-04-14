@@ -1,81 +1,144 @@
 (function () {
-  console.log('[Helper] Injected sketchfab-helper.js');
+    console.log('[Helper] Sketchfab Helper Loaded');
 
-  function waitForSketchfab(callback) {
-    const interval = setInterval(() => {
-      if (typeof Sketchfab !== 'undefined') {
-        clearInterval(interval);
-        callback();
-      }
-    }, 100);
-  }
+    function waitForSketchfabAPI() {
+        if (typeof Sketchfab === 'undefined') {
+            return setTimeout(waitForSketchfabAPI, 500);
+        }
 
-  // Run after Sketchfab is ready
-  waitForSketchfab(() => {
-    console.log('[Helper] Sketchfab is available!');
+        const iframe = window.frameElement;
+        const uidMatch = window.location.href.match(/\/models\/([a-f0-9]+)/i);
+        const uid = uidMatch ? uidMatch[1] : null;
 
-    const iframe = document.querySelector('iframe');
+        if (!uid) {
+            console.error('[Helper] Could not find model UID in URL');
+            return;
+        }
 
-    if (!iframe) {
-      console.error('[Helper] No iframe found.');
-      return;
+        const client = new Sketchfab(iframe);
+        client.init(uid, {
+            success(api) {
+                api.start();
+                api.addEventListener('viewerready', function () {
+                    console.log('[Helper] Sketchfab Viewer Ready');
+                    setupExportButton(api);
+                });
+            },
+            error() {
+                console.error('[Helper] Sketchfab API init failed');
+            }
+        });
     }
 
-    const uid = iframe.src.match(/\/models\/([^/?]+)/)?.[1];
-    if (!uid) {
-      console.error('[Helper] Could not extract model UID.');
-      return;
+    function setupExportButton(api) {
+        const btn = document.createElement('button');
+        btn.textContent = '⬇️ Download Model (OBJ)';
+        btn.style.position = 'absolute';
+        btn.style.top = '10px';
+        btn.style.left = '10px';
+        btn.style.zIndex = 9999;
+        btn.style.padding = '10px';
+        btn.style.background = '#1eaedb';
+        btn.style.color = '#fff';
+        btn.style.border = 'none';
+        btn.style.borderRadius = '5px';
+        btn.style.cursor = 'pointer';
+        btn.style.fontWeight = 'bold';
+        document.body.appendChild(btn);
+
+        btn.addEventListener('click', () => exportModel(api));
     }
 
-    const client = new Sketchfab(iframe);
+    async function exportModel(api) {
+        console.log('[Helper] Extracting geometry...');
+        const zip = new JSZip();
+        const mtlParts = [];
+        const objParts = [];
+        const textureMap = new Map();
+        let modelName = document.title.split(' - ')[0].trim().replace(/[^\w\d\-]/g, '_');
 
-    client.init(uid, {
-      success: function (api) {
-        console.log('[Helper] API initialized, ready to extract geometry.');
+        const scene = await api.getSceneGraph();
+        const meshes = [];
 
-        // Listen for command from parent
-        window.addEventListener('message', function (event) {
-          if (event.data && event.data.type === 'EXTRACT_GEOMETRY') {
-            console.log('[Helper] Received EXTRACT_GEOMETRY command');
-            extractGeometry(api);
-          }
+        scene.traverse((node) => {
+            if (node.type === 'Geometry') {
+                meshes.push(node);
+            }
         });
 
-        // Let parent know we're ready
-        window.parent.postMessage({ type: 'HELPER_READY' }, '*');
-      },
-      error: function () {
-        console.error('[Helper] Sketchfab API init failed.');
-      }
-    });
-  });
+        const materialMap = await api.getMaterialList();
 
-  // Example extraction handler (just logs mesh list for now)
-  function extractGeometry(api) {
-    api.getSceneGraph(function (err, graph) {
-      if (err) {
-        console.error('[Helper] Error getting scene graph:', err);
-        return;
-      }
+        for (let i = 0; i < meshes.length; i++) {
+            const geom = meshes[i];
+            const meshData = await api.getGeometry(geom.instanceID);
 
-      console.log('[Helper] Scene graph received:', graph);
+            const obj = [];
+            const mtl = [];
 
-      // You can walk the graph and send mesh info to the parent window
-      const meshes = [];
+            const meshName = geom.name || `mesh_${i}`;
+            obj.push(`o ${meshName}`);
 
-      function walk(node) {
-        if (node.type === 'Mesh') {
-          meshes.push({ name: node.name, node: node });
+            let vOffset = 1;
+
+            for (const prim of meshData) {
+                if (!prim.positions) continue;
+
+                const positions = prim.positions;
+                const normals = prim.normals || [];
+                const uvs = prim.uvs || [];
+                const indices = prim.indices || [];
+
+                for (let j = 0; j < positions.length; j += 3) {
+                    obj.push(`v ${positions[j]} ${positions[j + 1]} ${positions[j + 2]}`);
+                }
+                for (let j = 0; j < normals.length; j += 3) {
+                    obj.push(`vn ${normals[j]} ${normals[j + 1]} ${normals[j + 2]}`);
+                }
+                for (let j = 0; j < uvs.length; j += 2) {
+                    obj.push(`vt ${uvs[j]} ${uvs[j + 1]}`);
+                }
+
+                const materialName = `material_${i}`;
+                obj.push(`usemtl ${materialName}`);
+                mtl.push(`newmtl ${materialName}`);
+
+                // Handle textures
+                const mat = materialMap.find(m => m.instanceID === prim.materialId);
+                if (mat && mat.channels && mat.channels.AlbedoPBR) {
+                    const tex = mat.channels.AlbedoPBR.texture;
+                    if (tex && tex.uid && tex.url && !textureMap.has(tex.uid)) {
+                        const res = await fetch(tex.url);
+                        const blob = await res.blob();
+                        const fileName = `textures/${tex.uid}.jpg`;
+                        zip.file(fileName, blob);
+                        textureMap.set(tex.uid, fileName);
+                        mtl.push(`map_Kd ${fileName}`);
+                    }
+                }
+
+                for (let j = 0; j < indices.length; j += 3) {
+                    const a = indices[j] + vOffset;
+                    const b = indices[j + 1] + vOffset;
+                    const c = indices[j + 2] + vOffset;
+                    obj.push(`f ${a}/${a}/${a} ${b}/${b}/${b} ${c}/${c}/${c}`);
+                }
+
+                vOffset += positions.length / 3;
+            }
+
+            zip.file(`${meshName}.obj`, obj.join('\n'));
+            zip.file(`${meshName}.mtl`, mtl.join('\n'));
         }
-        if (node.children) {
-          node.children.forEach(walk);
-        }
-      }
 
-      walk(graph);
+        console.log('[Helper] Zipping...');
+        const blob = await zip.generateAsync({ type: 'blob' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${modelName}.zip`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
 
-      // Send result to parent
-      window.parent.postMessage({ type: 'GEOMETRY_DATA', data: meshes }, '*');
-    });
-  }
+    waitForSketchfabAPI();
 })();
